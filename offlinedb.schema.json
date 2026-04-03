@@ -1,0 +1,10 @@
+{
+  "metadataSchema": "offlinedb",
+  "schema": "public",
+  "tables": [
+    {
+      "name": "tasks",
+      "primaryKey": "id"
+    }
+  ]
+}

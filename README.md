@@ -24,12 +24,43 @@ It replaces the old client/server split for the Neon path with:
 pnpm add @appurist/offlinedb
 ```
 
+## Neon Setup
+
+Admin/setup work uses a Postgres connection string through `DATABASE_URL`.
+That connection string is for migrations and schema installation only.
+It must not be used by browser runtime code.
+
+All Neon runtime URLs are developer-supplied application configuration.
+The library does not hard-code:
+
+- Neon Auth URLs
+- Neon Data API / SQL URLs
+- project-specific endpoints
+- environment-specific connection details
+
+This repo includes:
+
+- [`offlinedb.schema.json`](./offlinedb.schema.json): synced table config
+- `pnpm run db:print-sql`: print install SQL
+- `pnpm run db:apply`: apply install SQL with `psql`
+
+Example:
+
+```bash
+$env:DATABASE_URL="postgresql://..."
+pnpm run db:apply
+```
+
+The browser runtime should use Neon Auth plus direct authenticated HTTP/Data API calls.
+
 ## Usage
 
 ```js
 import {
   OfflineDbClient,
-  createNeonHttpTransport,
+  createOdbAuthClient,
+  createOdbDataClient,
+  createOdbSyncTransport,
   defineTable
 } from "@appurist/offlinedb";
 
@@ -38,12 +69,20 @@ const tasks = defineTable({
   primaryKey: "id"
 });
 
+const auth = createOdbAuthClient({
+  baseUrl: appConfig.neonAuthUrl
+});
+
+const data = createOdbDataClient({
+  baseUrl: appConfig.neonDataUrl,
+  getAuthToken: async () => appSession.accessToken
+});
+
 const client = await OfflineDbClient.open({
   persistence: "indexeddb",
   databaseName: "app-cache",
-  transport: createNeonHttpTransport({
-    baseUrl: "https://example.neon.tech/sql",
-    getAuthToken: async () => "jwt"
+  transport: createOdbSyncTransport({
+    dataClient: data
   }),
   tables: [tasks]
 });
@@ -76,6 +115,9 @@ await client.sync();
 - `LocalStoragePersistence`
 - `defineTable`
 - `createNeonHttpTransport`
+- `createOdbAuthClient`
+- `createOdbDataClient`
+- `createOdbSyncTransport`
 - `createOfflinedbInstallSql`
 - `createSyncedTableSql`
 
@@ -85,6 +127,9 @@ That document describes:
 - constructor/open options
 - the persistence contract and the built-in `"indexeddb"`, `"localstorage"`, and `"memory"` selectors
 - local-id/global-id mutation and sync request/response shapes
+- direct Neon Auth and Data API wrappers with `odb*` method names
+- the separation between developer-supplied Neon config and library code
+- setup scripts that install the database-side SQL from `DATABASE_URL`
 - table definition objects and full-replica sync behavior
 - transport expectations
 - SQL generator inputs and outputs

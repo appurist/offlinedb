@@ -6,6 +6,11 @@ export {
   createNeonHttpTransport
 } from "./client.js";
 export {
+  createOdbAuthClient,
+  createOdbDataClient,
+  createOdbSyncTransport
+} from "./neon.js";
+export {
   defineTable
 } from "./schema.js";
 export {

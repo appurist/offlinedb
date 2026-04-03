@@ -9,9 +9,13 @@
   "files": [
     "src",
     "docs",
+    "scripts",
+    "offlinedb.schema.json",
     "README.md"
   ],
   "scripts": {
+    "db:print-sql": "node ./scripts/print-schema-sql.mjs",
+    "db:apply": "node ./scripts/apply-schema.mjs",
     "test": "node --test --test-isolation=none"
   }
 }

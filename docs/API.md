@@ -9,9 +9,15 @@ Current exports from [src/index.js](C:/dev/appurist/offline/offlinedb/src/index.
 - `InMemoryPersistence`
 - `LocalStoragePersistence`
 - `createNeonHttpTransport`
+- `createOdbAuthClient`
+- `createOdbDataClient`
+- `createOdbSyncTransport`
 - `defineTable`
 - `createOfflinedbInstallSql`
 - `createSyncedTableSql`
+
+All Neon URLs used by these APIs are developer-supplied configuration.
+The library does not embed project-specific Neon Auth or Data API endpoints.
 
 ## `OfflineDbClient`
 
@@ -312,10 +318,13 @@ const persistence = new InMemoryPersistence();
 
 ## `createNeonHttpTransport(options)`
 
-Creates a simple HTTP transport for the sync RPC endpoint.
+Creates a simple HTTP transport for a developer-supplied HTTP sync endpoint.
+
+This helper still exists in the scaffold, but the intended Neon-native direction is direct Neon Auth and Data API calls via the `odb*` clients below rather than an app-owned sync service.
 
 ```js
 const transport = createNeonHttpTransport({
+  // Supplied by the app.
   baseUrl: "https://example.neon.tech/sql",
   getAuthToken: async () => sessionToken
 });
@@ -341,6 +350,92 @@ const transport = createNeonHttpTransport({
 - Serializes the sync request body as JSON
 - Throws when the HTTP response is not `2xx`
 - Returns `await response.json()`
+
+## `createOdbAuthClient(options)`
+
+Creates direct Neon Auth wrappers using `odb*` method names.
+
+```js
+const auth = createOdbAuthClient({
+  baseUrl: appConfig.neonAuthUrl
+});
+```
+
+### `options`
+
+- `baseUrl`
+  Developer-supplied Neon Auth base URL.
+- `fetchImpl`
+  Optional fetch implementation.
+- `endpoints`
+  Optional endpoint overrides for auth routes.
+
+### Methods
+
+- `odbLoginWithPassword({ email, password, rememberMe?, callbackURL? })`
+- `odbSignUpWithPassword({ email, password, name?, callbackURL?, image? })`
+- `odbLogout()`
+
+## `createOdbDataClient(options)`
+
+Creates direct Neon Data API wrappers using `odb*` method names.
+
+```js
+const data = createOdbDataClient({
+  baseUrl: appConfig.neonDataUrl,
+  getAuthToken: async () => sessionToken
+});
+```
+
+### `options`
+
+- `baseUrl`
+  Developer-supplied Neon Data API or SQL base URL.
+- `fetchImpl`
+  Optional fetch implementation.
+- `getAuthToken`
+  Optional async token provider.
+- `headers`
+  Optional default headers.
+
+### Methods
+
+- `odbRequest({ path, method?, body?, headers? })`
+- `odbRpc(functionName, args?)`
+
+## `createOdbSyncTransport(options)`
+
+Creates a direct-Neon sync transport that calls database RPC functions through `createOdbDataClient()`.
+
+```js
+const data = createOdbDataClient({
+  baseUrl: appConfig.neonDataUrl,
+  getAuthToken: async () => sessionToken
+});
+
+const transport = createOdbSyncTransport({
+  dataClient: data
+});
+```
+
+### `options`
+
+- `dataClient`
+  Data client created by `createOdbDataClient()`.
+- `mutateFunctionName`
+  Optional function-name override or name resolver for per-table mutate RPCs.
+  Defaults to `mutate_<table>`.
+- `pullFunctionName`
+  Optional pull RPC name.
+  Defaults to `pull_changes`.
+
+### Behavior
+
+- calls `mutate_<table>` once per pending local change
+- then calls `pull_changes(lastGlobalId, tables?)`
+- returns the normalized sync result expected by `OfflineDbClient`
+
+This is the intended browser runtime path for the Neon-native version of the library.
 
 ## `defineTable(input)`
 

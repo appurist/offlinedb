@@ -68,6 +68,7 @@ BEGIN
   END IF;
 
   INSERT INTO ${qualified(schema, "global_mutation")} (
+    global_id,
     table_name,
     row_key,
     owner_id,
@@ -77,6 +78,7 @@ BEGIN
     row_data
   )
   VALUES (
+    CASE WHEN TG_OP = 'DELETE' THEN OLD.global_id ELSE NEW.global_id END,
     TG_TABLE_NAME,
     next_key,
     next_owner_id,
@@ -92,6 +94,45 @@ BEGIN
 
   RETURN NEW;
 END;
+$$;
+
+CREATE OR REPLACE FUNCTION ${qualified(schema, "pull_changes")}(
+  p_last_global_id BIGINT DEFAULT 0,
+  p_tables TEXT[] DEFAULT NULL
+)
+RETURNS JSONB
+LANGUAGE SQL
+STABLE
+AS $$
+  WITH selected AS (
+    SELECT
+      gm.global_id,
+      gm.table_name,
+      gm.row_key,
+      gm.row_data
+    FROM ${qualified(schema, "global_mutation")} gm
+    WHERE gm.global_id > COALESCE(p_last_global_id, 0)
+      AND (p_tables IS NULL OR gm.table_name = ANY(p_tables))
+    ORDER BY gm.global_id ASC
+  )
+  SELECT jsonb_build_object(
+    'changes',
+    COALESCE(
+      jsonb_agg(
+        jsonb_build_object(
+          'globalId', selected.global_id,
+          'table', selected.table_name,
+          'key', selected.row_key,
+          'row', selected.row_data
+        )
+        ORDER BY selected.global_id
+      ),
+      '[]'::jsonb
+    ),
+    'lastGlobalId',
+    COALESCE(MAX(selected.global_id), COALESCE(p_last_global_id, 0))
+  )
+  FROM selected
 $$;
 `.trim();
 }
@@ -132,6 +173,15 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
   NEW.${table.updatedAtColumn} := NOW();
+  IF TG_OP = 'INSERT' THEN
+    IF COALESCE(NEW.${table.globalIdColumn}, 0) <= 0 THEN
+      NEW.${table.globalIdColumn} := nextval(pg_get_serial_sequence('${qualified(metadataSchema, "global_mutation")}', 'global_id'));
+    END IF;
+  ELSE
+    IF COALESCE(NEW.${table.globalIdColumn}, 0) <= COALESCE(OLD.${table.globalIdColumn}, 0) THEN
+      NEW.${table.globalIdColumn} := nextval(pg_get_serial_sequence('${qualified(metadataSchema, "global_mutation")}', 'global_id'));
+    END IF;
+  END IF;
   IF TG_OP = 'INSERT' THEN
     NEW.${table.revisionColumn} := COALESCE(NEW.${table.revisionColumn}, 0) + 1;
   ELSE
@@ -181,7 +231,6 @@ DECLARE
   next_row ${tableName}%ROWTYPE;
   set_clause TEXT;
   upsert_sql TEXT;
-  assigned_global_id BIGINT;
 BEGIN
   SELECT *
   INTO existing_row
@@ -200,31 +249,6 @@ BEGIN
   INSERT INTO ${qualified(metadataSchema, "applied_mutation")} (user_id, local_id, table_name, row_key)
   VALUES (${qualified(metadataSchema, "current_user_id")}(), p_local_id, ${quoteText(table.name)}, p_row_key)
   ON CONFLICT (user_id, local_id) DO NOTHING;
-
-  INSERT INTO ${qualified(metadataSchema, "global_mutation")} (
-    table_name,
-    row_key,
-    owner_id,
-    local_id,
-    revision,
-    operation,
-    row_data
-  )
-  VALUES (
-    ${quoteText(table.name)},
-    p_row_key,
-    COALESCE(p_values ->> ${quoteText(table.ownerColumn)}, ${qualified(metadataSchema, "current_user_id")}()),
-    p_local_id,
-    COALESCE((p_values ->> ${quoteText(table.revisionColumn)})::BIGINT, p_base_revision + 1),
-    CASE WHEN FOUND THEN 'update' ELSE 'insert' END,
-    p_values
-  )
-  RETURNING global_id INTO assigned_global_id;
-
-  UPDATE ${qualified(metadataSchema, "applied_mutation")}
-  SET global_id = assigned_global_id
-  WHERE user_id = ${qualified(metadataSchema, "current_user_id")}()
-    AND local_id = p_local_id;
 
   SELECT string_agg(
     format('%1$I = EXCLUDED.%1$I', column_name),
@@ -256,14 +280,22 @@ BEGIN
         to_jsonb(COALESCE(p_values ->> ${quoteText(table.ownerColumn)}, ${qualified(metadataSchema, "current_user_id")}()))
       ),
       ${quoteText(`{${table.globalIdColumn}}`)},
-      to_jsonb(assigned_global_id)
+      COALESCE(
+        p_values -> ${quoteText(table.globalIdColumn)},
+        '0'::jsonb
+      )
     )
     INTO next_row;
+
+  UPDATE ${qualified(metadataSchema, "applied_mutation")}
+  SET global_id = next_row.${table.globalIdColumn}
+  WHERE user_id = ${qualified(metadataSchema, "current_user_id")}()
+    AND local_id = p_local_id;
 
   RETURN jsonb_build_object(
     'ok', true,
     'localId', p_local_id,
-    'globalId', assigned_global_id,
+    'globalId', next_row.${table.globalIdColumn},
     'row', to_jsonb(next_row)
   );
 END;
