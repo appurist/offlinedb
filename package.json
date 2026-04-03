@@ -1,0 +1,17 @@
+{
+  "name": "@appurist/offlinedb",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Browser-first offline table client for Neon Auth and Postgres RLS.",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "docs",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test --test-isolation=none"
+  }
+}
