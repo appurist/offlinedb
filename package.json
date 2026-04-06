@@ -1,6 +1,6 @@
 {
   "name": "@appurist/offlinedb",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "description": "Browser-first offline table client for Neon Auth and Postgres RLS.",
   "exports": {
@@ -17,5 +17,23 @@
     "db:print-sql": "node ./scripts/print-schema-sql.mjs",
     "db:apply": "node ./scripts/apply-schema.mjs",
     "test": "node --test --test-isolation=none"
-  }
+  },
+  "license": "MIT",
+  "author": "Appurist Software Inc. <dev@appurist.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/appurist/offlinedb.git"
+  },
+  "homepage": "https://github.com/appurist/offlinedb#readme",
+  "bugs": {
+    "url": "https://github.com/appurist/offlinedb/issues"
+  },
+  "keywords": [
+    "offline",
+    "indexeddb",
+    "neon",
+    "postgres",
+    "rls",
+    "sync"
+  ]
 }
