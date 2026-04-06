@@ -299,6 +299,90 @@ test("sync accepts optional table filtering", async () => {
   assert.deepEqual(requestBody.tables, ["notes"]);
 });
 
+test("getSyncStatus reports pending and touched rows", async () => {
+  const tasks = defineTable({ name: "tasks" });
+  const client = await OfflineDbClient.open({
+    persistence: "memory",
+    transport: {
+      async sync() {
+        return {
+          accepted: [],
+          conflicts: [],
+          changes: [],
+          lastGlobalId: 0
+        };
+      }
+    },
+    tables: [tasks],
+    now: () => new Date("2026-04-03T12:00:00.000Z"),
+    idFactory: () => "m1"
+  });
+
+  await client.mutate({
+    table: "tasks",
+    key: "task-1",
+    values: { title: "Touched" }
+  });
+
+  const status = await client.getSyncStatus({ tables: ["tasks"] });
+  assert.equal(status.pendingCount, 1);
+  assert.equal(status.touchedCount, 1);
+});
+
+test("repairSync can queue all local rows and reset pull cursor for catch-up", async () => {
+  const tasks = defineTable({ name: "tasks" });
+  const persistence = new InMemoryPersistence();
+  const requests = [];
+  const client = await OfflineDbClient.open({
+    persistence,
+    transport: {
+      async sync(request) {
+        requests.push(request);
+        return {
+          accepted: request.mutations.map((mutation, index) => ({
+            localId: mutation.localId,
+            globalId: index + 1,
+            row: {
+              ...mutation.values,
+              local_id: null,
+              global_id: index + 1
+            }
+          })),
+          conflicts: [],
+          changes: [],
+          lastGlobalId: 33
+        };
+      }
+    },
+    tables: [tasks],
+    now: () => new Date("2026-04-03T12:00:00.000Z"),
+    idFactory: (() => {
+      let id = 0;
+      return () => `m${++id}`;
+    })()
+  });
+
+  await persistence.saveRow("tasks", "task-1", {
+    id: "task-1",
+    title: "Local only",
+    revision: 1,
+    local_id: null,
+    global_id: 0
+  });
+  await persistence.setLastGlobalId(99);
+
+  const result = await client.repairSync({ tables: ["tasks"], includeAllLocalRows: true });
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].lastGlobalId, 0);
+  assert.equal(requests[0].mutations.length, 1);
+  assert.equal(requests[0].mutations[0].key, "task-1");
+  assert.equal(result.queued, 1);
+  assert.equal(result.pending, 0);
+  assert.equal((await client.getSyncStatus({ tables: ["tasks"] })).touchedCount, 0);
+  assert.equal(await persistence.getLastGlobalId(), 33);
+});
+
 function createFakeIndexedDb() {
   const databases = new Map();
 

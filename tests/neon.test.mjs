@@ -50,7 +50,7 @@ test("odb data client sends bearer token and rpc path", async () => {
   assert.equal(calls[0].init.headers.authorization, "Bearer jwt-123");
 });
 
-test("odb sync transport uses direct rpc calls for mutate and pull", async () => {
+test("odb sync transport uses direct rpc calls for mutate and paged pull", async () => {
   const calls = [];
   const data = {
     async odbRpc(fn, args) {
@@ -68,7 +68,7 @@ test("odb sync transport uses direct rpc calls for mutate and pull", async () =>
         };
       }
 
-      if (fn === "pull_changes") {
+      if (fn === "pull_changes_page") {
         return {
           changes: [
             {
@@ -82,7 +82,8 @@ test("odb sync transport uses direct rpc calls for mutate and pull", async () =>
               }
             }
           ],
-          lastGlobalId: 7
+          lastGlobalId: 7,
+          hasMore: false
         };
       }
 
@@ -109,7 +110,75 @@ test("odb sync transport uses direct rpc calls for mutate and pull", async () =>
   });
 
   assert.equal(calls[0].fn, "mutate_tasks");
-  assert.equal(calls[1].fn, "pull_changes");
+  assert.equal(calls[1].fn, "pull_changes_page");
+  assert.equal(calls[1].args.p_limit, 500);
   assert.equal(result.accepted[0].globalId, 7);
   assert.equal(result.lastGlobalId, 7);
+});
+
+test("odb sync transport falls back to legacy pull when paged rpc is unavailable", async () => {
+  const calls = [];
+  const data = {
+    async odbRpc(fn, args) {
+      calls.push({ fn, args });
+      if (fn === "pull_changes_page") {
+        throw new Error("function offlinedb.pull_changes_page does not exist");
+      }
+
+      if (fn === "pull_changes") {
+        return {
+          changes: [],
+          lastGlobalId: 11
+        };
+      }
+
+      throw new Error(`Unexpected rpc ${fn}`);
+    }
+  };
+
+  const transport = createOdbSyncTransport({ dataClient: data });
+  const result = await transport.sync({
+    mutations: [],
+    tables: ["tasks"],
+    lastGlobalId: 9
+  });
+
+  assert.deepEqual(calls.map((call) => call.fn), ["pull_changes_page", "pull_changes"]);
+  assert.equal(result.lastGlobalId, 11);
+});
+
+test("odb sync transport pulls multiple pages", async () => {
+  const calls = [];
+  const data = {
+    async odbRpc(fn, args) {
+      calls.push({ fn, args });
+      if (fn !== "pull_changes_page") {
+        throw new Error(`Unexpected rpc ${fn}`);
+      }
+
+      return {
+        changes: [
+          {
+            globalId: args.p_last_global_id + 1,
+            table: "tasks",
+            key: `task-${args.p_last_global_id + 1}`,
+            row: null
+          }
+        ],
+        lastGlobalId: args.p_last_global_id + 1,
+        hasMore: args.p_last_global_id < 1
+      };
+    }
+  };
+
+  const transport = createOdbSyncTransport({ dataClient: data, pullPageSize: 2 });
+  const result = await transport.sync({
+    mutations: [],
+    tables: ["tasks"],
+    lastGlobalId: 0
+  });
+
+  assert.deepEqual(calls.map((call) => call.args.p_last_global_id), [0, 1]);
+  assert.equal(result.changes.length, 2);
+  assert.equal(result.lastGlobalId, 2);
 });

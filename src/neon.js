@@ -108,7 +108,10 @@ export function createOdbDataClient(options) {
  * @param {{
  *   dataClient: ReturnType<typeof createOdbDataClient>,
  *   mutateFunctionName?: ((table: string) => string) | string,
- *   pullFunctionName?: string
+ *   pullFunctionName?: string,
+ *   pullPageFunctionName?: string,
+ *   pullPageSize?: number,
+ *   pullPageMinSize?: number
  * }} options
  */
 export function createOdbSyncTransport(options) {
@@ -117,6 +120,9 @@ export function createOdbSyncTransport(options) {
       ? options.mutateFunctionName
       : (table) => options.mutateFunctionName ?? `mutate_${table}`;
   const pullFunctionName = options.pullFunctionName ?? "pull_changes";
+  const pullPageFunctionName = options.pullPageFunctionName ?? "pull_changes_page";
+  const pullPageSize = Number(options.pullPageSize ?? 500);
+  const pullPageMinSize = Number(options.pullPageMinSize ?? 25);
 
   return {
     async sync(request) {
@@ -149,12 +155,14 @@ export function createOdbSyncTransport(options) {
         });
       }
 
-      const pull = normalizeRpcResult(
-        await options.dataClient.odbRpc(pullFunctionName, {
-          p_last_global_id: request.lastGlobalId,
-          p_tables: request.tables?.length ? request.tables : null
-        })
-      ) ?? { changes: [], lastGlobalId: request.lastGlobalId };
+      const pull = await pullChangesPaged({
+        dataClient: options.dataClient,
+        pullFunctionName,
+        pullPageFunctionName,
+        request,
+        initialPageSize: pullPageSize,
+        minPageSize: pullPageMinSize
+      });
 
       return {
         accepted,
@@ -168,6 +176,63 @@ export function createOdbSyncTransport(options) {
       };
     }
   };
+}
+
+async function pullChangesPaged(args) {
+  let pageSize = args.initialPageSize;
+  let lastGlobalId = Number(args.request.lastGlobalId ?? 0);
+  const changes = [];
+
+  while (true) {
+    let page;
+    try {
+      page = normalizeRpcResult(
+        await args.dataClient.odbRpc(args.pullPageFunctionName, {
+          p_last_global_id: lastGlobalId,
+          p_tables: args.request.tables?.length ? args.request.tables : null,
+          p_limit: pageSize
+        })
+      );
+    } catch (error) {
+      if (isMissingPagedFunction(error)) {
+        return normalizeRpcResult(
+          await args.dataClient.odbRpc(args.pullFunctionName, {
+            p_last_global_id: lastGlobalId,
+            p_tables: args.request.tables?.length ? args.request.tables : null
+          })
+        ) ?? { changes: [], lastGlobalId };
+      }
+      if (!isResponseTooLarge(error) || pageSize <= args.minPageSize) {
+        throw error;
+      }
+      pageSize = Math.max(args.minPageSize, Math.floor(pageSize / 2));
+      continue;
+    }
+
+    if (!page || !Array.isArray(page.changes)) {
+      page = normalizeRpcResult(
+        await args.dataClient.odbRpc(args.pullFunctionName, {
+          p_last_global_id: lastGlobalId,
+          p_tables: args.request.tables?.length ? args.request.tables : null
+        })
+      ) ?? { changes: [], lastGlobalId };
+    }
+
+    changes.push(...(page.changes ?? []));
+    const nextGlobalId = Number(page.lastGlobalId ?? lastGlobalId);
+    if (nextGlobalId <= lastGlobalId || page.hasMore !== true) {
+      return { changes, lastGlobalId: nextGlobalId };
+    }
+    lastGlobalId = nextGlobalId;
+  }
+}
+
+function isResponseTooLarge(error) {
+  return /response is too large|max is 10485760/i.test(error?.message ?? "");
+}
+
+function isMissingPagedFunction(error) {
+  return /status 404|function .*pull_changes_page|could not find.*pull_changes_page|schema cache/i.test(error?.message ?? "");
 }
 
 async function odbPostJson(fetchImpl, url, body) {

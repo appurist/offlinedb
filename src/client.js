@@ -18,6 +18,18 @@ import { defineTable } from "./schema.js";
  * @typedef {{
  *   table: string,
  *   key: string,
+ *   operation: "upsert" | "delete",
+ *   firstTouchedAt: string,
+ *   lastTouchedAt: string,
+ *   attemptCount: number,
+ *   lastError?: string | null
+ * }} TouchedRow
+ */
+
+/**
+ * @typedef {{
+ *   table: string,
+ *   key: string,
  *   row: Record<string, unknown> | null
  * }} ChangeRecord
  */
@@ -124,6 +136,44 @@ export class OfflineDbClient {
 
     await this.persistence.saveRow(table.name, args.key, mutation.values);
     await this.persistence.appendPendingMutation(mutation);
+    await this.persistence.recordTouchedRow?.({
+      table: table.name,
+      key: args.key,
+      operation: "upsert",
+      occurredAt: nowIso
+    });
+    return mutation;
+  }
+
+  /**
+   * Queue a delete tombstone and optimistically remove the local row.
+   * @param {{table: string, key: string, metadata?: Record<string, unknown>}} args
+   */
+  async delete(args) {
+    const table = this.#requireTable(args.table);
+    const current = await this.persistence.getRow(table.name, args.key);
+    const nowIso = this.now().toISOString();
+    const localId = this.idFactory();
+    const mutation = {
+      localId,
+      globalId: 0,
+      clientSequence: await this.persistence.nextClientSequence(),
+      table: table.name,
+      key: args.key,
+      baseRevision: Number(current?.[table.revisionColumn] ?? 0),
+      values: null,
+      occurredAt: nowIso,
+      metadata: args.metadata
+    };
+
+    await this.persistence.deleteRow(table.name, args.key);
+    await this.persistence.appendPendingMutation(mutation);
+    await this.persistence.recordTouchedRow?.({
+      table: table.name,
+      key: args.key,
+      operation: "delete",
+      occurredAt: nowIso
+    });
     return mutation;
   }
 
@@ -198,6 +248,104 @@ export class OfflineDbClient {
     return result;
   }
 
+  /**
+   * Requeue touched rows, optionally every local row, then run normal bidirectional sync.
+   * @param {{tables?: string[], includeAllLocalRows?: boolean, onProgress?: (progress: {phase: string, current: number, total: number, label?: string}) => void}=} options
+   */
+  async repairSync(options = {}) {
+    const tableNames = this.#resolveTables(options.tables);
+    const nowIso = this.now().toISOString();
+    const touched = await this.persistence.listTouchedRows?.(tableNames) ?? [];
+    const touchedKeys = new Set(touched.map((entry) => `${entry.table}:${entry.key}`));
+    const candidates = [...touched];
+
+    if (options.includeAllLocalRows) {
+      for (const table of tableNames) {
+        const rows = await this.persistence.listRows(table);
+        for (const row of rows) {
+          const tableDef = this.#requireTable(table);
+          const key = String(row?.[tableDef.primaryKey] ?? row?.id ?? "");
+          if (!key || touchedKeys.has(`${table}:${key}`)) {
+            continue;
+          }
+          candidates.push({
+            table,
+            key,
+            operation: "upsert",
+            firstTouchedAt: nowIso,
+            lastTouchedAt: nowIso,
+            attemptCount: 0,
+            lastError: null
+          });
+        }
+      }
+    }
+
+    options.onProgress?.({ phase: "queue", current: 0, total: candidates.length, label: "Queueing local changes..." });
+    let queued = 0;
+    const queuedTouched = [];
+    for (const entry of candidates) {
+      const table = this.#requireTable(entry.table);
+      try {
+        if (entry.operation === "delete") {
+          await this.delete({ table: table.name, key: entry.key });
+        } else {
+          const row = await this.persistence.getRow(table.name, entry.key);
+          if (!row) {
+            await this.persistence.clearTouchedRows?.([entry]);
+            queued += 1;
+            options.onProgress?.({ phase: "queue", current: queued, total: candidates.length, label: `Queued ${queued} of ${candidates.length}` });
+            continue;
+          }
+          await this.mutate({ table: table.name, key: entry.key, values: row });
+        }
+        queuedTouched.push(entry);
+      } catch (error) {
+        await this.persistence.markTouchedRowError?.(entry.table, entry.key, error.message);
+      }
+      queued += 1;
+      options.onProgress?.({ phase: "queue", current: queued, total: candidates.length, label: `Queued ${queued} of ${candidates.length}` });
+    }
+
+    options.onProgress?.({ phase: "sync", current: 0, total: 1, label: "Syncing with cloud..." });
+    const originalLastGlobalId = await this.persistence.getLastGlobalId();
+    await this.persistence.setLastGlobalId(0);
+    let result;
+    try {
+      result = await this.sync({ tables: tableNames });
+    } catch (error) {
+      await this.persistence.setLastGlobalId(originalLastGlobalId);
+      throw error;
+    }
+    const pending = await this.persistence.getPendingMutations();
+    const pendingKeys = new Set(pending.map((mutation) => `${mutation.table}:${mutation.key}`));
+    const clearable = queuedTouched.filter((entry) => !pendingKeys.has(`${entry.table}:${entry.key}`));
+    await this.persistence.clearTouchedRows?.(clearable);
+    options.onProgress?.({ phase: "sync", current: 1, total: 1, label: "Repair sync complete" });
+
+    return {
+      ...result,
+      touched: touched.length,
+      queued: queuedTouched.length,
+      clearedTouched: clearable.length,
+      pending: pending.length
+    };
+  }
+
+  async getSyncStatus(options = {}) {
+    const tableNames = this.#resolveTables(options.tables);
+    const [pending, touched] = await Promise.all([
+      this.persistence.getPendingMutations(),
+      this.persistence.listTouchedRows?.(tableNames) ?? []
+    ]);
+    const tableSet = new Set(tableNames);
+    return {
+      pendingCount: pending.filter((entry) => tableSet.has(entry.table)).length,
+      touchedCount: touched.length,
+      lastGlobalId: await this.persistence.getLastGlobalId()
+    };
+  }
+
   async exportState() {
     return this.persistence.exportState();
   }
@@ -267,6 +415,25 @@ export class IndexedDbPersistence {
 
   async appendPendingMutation(mutation) {
     await this.memory.appendPendingMutation(mutation);
+    await this.#persist();
+  }
+
+  async recordTouchedRow(entry) {
+    await this.memory.recordTouchedRow(entry);
+    await this.#persist();
+  }
+
+  async listTouchedRows(tableNames = []) {
+    return this.memory.listTouchedRows(tableNames);
+  }
+
+  async clearTouchedRows(entries) {
+    await this.memory.clearTouchedRows(entries);
+    await this.#persist();
+  }
+
+  async markTouchedRowError(table, key, error) {
+    await this.memory.markTouchedRowError(table, key, error);
     await this.#persist();
   }
 
@@ -381,6 +548,25 @@ export class LocalStoragePersistence {
     await this.#persist();
   }
 
+  async recordTouchedRow(entry) {
+    await this.memory.recordTouchedRow(entry);
+    await this.#persist();
+  }
+
+  async listTouchedRows(tableNames = []) {
+    return this.memory.listTouchedRows(tableNames);
+  }
+
+  async clearTouchedRows(entries) {
+    await this.memory.clearTouchedRows(entries);
+    await this.#persist();
+  }
+
+  async markTouchedRowError(table, key, error) {
+    await this.memory.markTouchedRowError(table, key, error);
+    await this.#persist();
+  }
+
   async getPendingMutations() {
     return this.memory.getPendingMutations();
   }
@@ -413,6 +599,7 @@ export class InMemoryPersistence {
   constructor() {
     this.rows = new Map();
     this.pending = new Map();
+    this.touched = new Map();
     this.lastGlobalId = 0;
     this.clientSequence = 0;
   }
@@ -444,6 +631,48 @@ export class InMemoryPersistence {
     this.pending.set(mutation.localId, clone(mutation));
   }
 
+  async recordTouchedRow(entry) {
+    const key = `${entry.table}:${entry.key}`;
+    const existing = this.touched.get(key);
+    const occurredAt = entry.occurredAt ?? new Date().toISOString();
+    this.touched.set(key, {
+      table: entry.table,
+      key: entry.key,
+      operation: entry.operation ?? existing?.operation ?? "upsert",
+      firstTouchedAt: existing?.firstTouchedAt ?? occurredAt,
+      lastTouchedAt: occurredAt,
+      attemptCount: Number(existing?.attemptCount ?? 0),
+      lastError: null
+    });
+  }
+
+  async listTouchedRows(tableNames = []) {
+    const tableSet = new Set(Array.isArray(tableNames) ? tableNames : [tableNames]);
+    return [...this.touched.values()]
+      .filter((entry) => tableSet.size === 0 || tableSet.has(entry.table))
+      .sort((left, right) => left.lastTouchedAt.localeCompare(right.lastTouchedAt))
+      .map(clone);
+  }
+
+  async clearTouchedRows(entries) {
+    for (const entry of entries ?? []) {
+      this.touched.delete(`${entry.table}:${entry.key}`);
+    }
+  }
+
+  async markTouchedRowError(table, key, error) {
+    const mapKey = `${table}:${key}`;
+    const existing = this.touched.get(mapKey);
+    if (!existing) {
+      return;
+    }
+    this.touched.set(mapKey, {
+      ...existing,
+      attemptCount: Number(existing.attemptCount ?? 0) + 1,
+      lastError: error ?? "Sync failed"
+    });
+  }
+
   async getPendingMutations() {
     return [...this.pending.values()].sort((left, right) => left.clientSequence - right.clientSequence);
   }
@@ -467,6 +696,7 @@ export class InMemoryPersistence {
       clientSequence: this.clientSequence,
       lastGlobalId: this.lastGlobalId,
       pending: await this.getPendingMutations(),
+      touched: await this.listTouchedRows(),
       rows: [...this.rows.entries()].map(([table, bucket]) => [table, [...bucket.entries()].map(([key, row]) => [key, clone(row)])])
     };
   }
@@ -475,10 +705,15 @@ export class InMemoryPersistence {
     this.clientSequence = Number(state?.clientSequence ?? 0);
     this.lastGlobalId = Number(state?.lastGlobalId ?? state?.watermark ?? state?.cursors?.global ?? 0);
     this.pending.clear();
+    this.touched.clear();
     this.rows.clear();
 
     for (const mutation of state?.pending ?? []) {
       this.pending.set(mutation.localId ?? mutation.mutationId, clone(mutation));
+    }
+
+    for (const entry of state?.touched ?? []) {
+      this.touched.set(`${entry.table}:${entry.key}`, clone(entry));
     }
 
     for (const [table, entries] of state?.rows ?? []) {
@@ -532,6 +767,10 @@ function resolvePersistence(options) {
  *   saveRow: (table: string, key: string, row: Record<string, unknown>) => Promise<void>,
  *   deleteRow: (table: string, key: string) => Promise<void>,
  *   appendPendingMutation: (mutation: PendingMutation) => Promise<void>,
+ *   recordTouchedRow?: (entry: {table: string, key: string, operation?: "upsert" | "delete", occurredAt?: string}) => Promise<void>,
+ *   listTouchedRows?: (tableNames?: string[]) => Promise<TouchedRow[]>,
+ *   clearTouchedRows?: (entries: TouchedRow[]) => Promise<void>,
+ *   markTouchedRowError?: (table: string, key: string, error: string) => Promise<void>,
  *   getPendingMutations: () => Promise<PendingMutation[]>,
  *   acknowledgeMutations: (mutationIds: string[]) => Promise<void>,
  *   getLastGlobalId: () => Promise<number>,
