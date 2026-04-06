@@ -63,12 +63,11 @@ BEGIN
     next_owner_id := NEW.owner_id;
     next_revision := NEW.revision;
     next_key := NEW.id::TEXT;
-    next_payload := to_jsonb(NEW);
+    next_payload := to_jsonb(NEW) - 'global_id';
     next_local_id := NEW.local_id;
   END IF;
 
   INSERT INTO ${qualified(schema, "global_mutation")} (
-    global_id,
     table_name,
     row_key,
     owner_id,
@@ -78,7 +77,6 @@ BEGIN
     row_data
   )
   VALUES (
-    CASE WHEN TG_OP = 'DELETE' THEN OLD.global_id ELSE NEW.global_id END,
     TG_TABLE_NAME,
     next_key,
     next_owner_id,

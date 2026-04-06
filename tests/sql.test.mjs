@@ -13,6 +13,9 @@ test("install sql includes metadata schema and helper functions", () => {
   assert.match(sql, /CREATE TABLE IF NOT EXISTS "offlinedb"\."global_mutation"/);
   assert.match(sql, /CREATE TABLE IF NOT EXISTS "offlinedb"\."applied_mutation"/);
   assert.match(sql, /CREATE OR REPLACE FUNCTION "offlinedb"\."record_change"/);
+  assert.match(sql, /next_payload := to_jsonb\(NEW\) - 'global_id';/);
+  assert.match(sql, /INSERT INTO "offlinedb"\."global_mutation" \(/);
+  assert.match(sql, /INSERT INTO "offlinedb"\."global_mutation" \(\s*table_name,/);
 });
 
 test("synced table sql includes required columns, triggers, RLS, and mutation rpc", () => {
@@ -35,3 +38,4 @@ test("synced table sql includes required columns, triggers, RLS, and mutation rp
   assert.match(sql, /CREATE OR REPLACE FUNCTION "offlinedb"\."mutate_tasks"/);
   assert.match(sql, /revision_conflict/);
 });
+
