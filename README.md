@@ -43,7 +43,7 @@ This repo includes:
 - [`offlinedb.schema.json`](./offlinedb.schema.json): synced table config
 - `pnpm run db:print-sql`: print install SQL
 - `pnpm run db:apply`: apply install SQL with `psql`
-- generated metadata tables, triggers, mutation RPCs, and baseline owner-write RLS
+- generated metadata tables, triggers, mutation RPCs, and baseline owner RLS
 
 The generated install SQL covers database-side `offlinedb` setup only.
 It does not provision Neon projects, branches, Auth, Data API, schema exposure, or CORS.
@@ -51,8 +51,7 @@ It does not provision Neon projects, branches, Auth, Data API, schema exposure, 
 Important RLS note:
 
 - generated SQL enables RLS on synced tables
-- generated SQL creates owner-scoped `INSERT` and `UPDATE` policies
-- generated SQL does not yet create `SELECT` policies automatically
+- generated SQL creates owner-scoped `SELECT`, `INSERT`, `UPDATE`, and `DELETE` policies
 - generated SQL does not yet create public-read, admin-read, admin-write, or app-specific policies automatically
 - grants, schema exposure, and any `SECURITY DEFINER` hardening still need to be reviewed and applied for your app
 
@@ -158,5 +157,7 @@ That document describes:
 ```bash
 pnpm test
 ```
+
+
 
 

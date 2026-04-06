@@ -18,7 +18,7 @@ Generates per-table SQL for:
 - required sync metadata columns
 - revision/update trigger
 - global-mutation trigger
-- owner-write RLS policies for `INSERT` and `UPDATE`
+- owner-scoped RLS policies for `SELECT`, `INSERT`, `UPDATE`, and `DELETE`
 - a table-specific mutation RPC function
 
 ## Caveats
@@ -31,7 +31,8 @@ The generated SQL is intentionally narrow:
 - it generates a table-specific mutation function
 - it expects the mutation payload to contain the full next row image
 - it uses `local_id` and `global_id` columns to represent unsynced and globally accepted writes
-- it does not yet generate `SELECT` policies automatically
 - it does not yet generate public-read, admin-read, or admin-write policies automatically
 - it does not configure grants, exposed schemas, CORS, or other Neon platform settings
+
+
 

@@ -25,6 +25,13 @@ test("synced table sql includes required columns, triggers, RLS, and mutation rp
   assert.match(sql, /ADD COLUMN IF NOT EXISTS "local_id" TEXT/);
   assert.match(sql, /ADD COLUMN IF NOT EXISTS "global_id" BIGINT NOT NULL DEFAULT 0/);
   assert.match(sql, /ENABLE ROW LEVEL SECURITY/);
+  assert.match(sql, /CREATE POLICY "tasks_owner_select"/);
+  assert.match(sql, /FOR SELECT/);
+  assert.match(sql, /CREATE POLICY "tasks_owner_insert"/);
+  assert.match(sql, /CREATE POLICY "tasks_owner_write"/);
+  assert.match(sql, /FOR UPDATE/);
+  assert.match(sql, /CREATE POLICY "tasks_owner_delete"/);
+  assert.match(sql, /FOR DELETE/);
   assert.match(sql, /CREATE OR REPLACE FUNCTION "offlinedb"\."mutate_tasks"/);
   assert.match(sql, /revision_conflict/);
 });

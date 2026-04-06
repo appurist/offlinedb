@@ -205,16 +205,26 @@ EXECUTE FUNCTION ${qualified(metadataSchema, "record_change")}();
 
 ALTER TABLE ${tableName} ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS ${quoteIdentifier(`${table.name}_owner_select`)} ON ${tableName};
+CREATE POLICY ${quoteIdentifier(`${table.name}_owner_select`)} ON ${tableName}
+  FOR SELECT
+  USING (${quoteIdentifier(table.ownerColumn)} = ${qualified(metadataSchema, "current_user_id")}());
+
+DROP POLICY IF EXISTS ${quoteIdentifier(`${table.name}_owner_insert`)} ON ${tableName};
+CREATE POLICY ${quoteIdentifier(`${table.name}_owner_insert`)} ON ${tableName}
+  FOR INSERT
+  WITH CHECK (${quoteIdentifier(table.ownerColumn)} = ${qualified(metadataSchema, "current_user_id")}());
+
 DROP POLICY IF EXISTS ${quoteIdentifier(`${table.name}_owner_write`)} ON ${tableName};
 CREATE POLICY ${quoteIdentifier(`${table.name}_owner_write`)} ON ${tableName}
   FOR UPDATE
   USING (${quoteIdentifier(table.ownerColumn)} = ${qualified(metadataSchema, "current_user_id")}())
   WITH CHECK (${quoteIdentifier(table.ownerColumn)} = ${qualified(metadataSchema, "current_user_id")}());
 
-DROP POLICY IF EXISTS ${quoteIdentifier(`${table.name}_owner_insert`)} ON ${tableName};
-CREATE POLICY ${quoteIdentifier(`${table.name}_owner_insert`)} ON ${tableName}
-  FOR INSERT
-  WITH CHECK (${quoteIdentifier(table.ownerColumn)} = ${qualified(metadataSchema, "current_user_id")}());
+DROP POLICY IF EXISTS ${quoteIdentifier(`${table.name}_owner_delete`)} ON ${tableName};
+CREATE POLICY ${quoteIdentifier(`${table.name}_owner_delete`)} ON ${tableName}
+  FOR DELETE
+  USING (${quoteIdentifier(table.ownerColumn)} = ${qualified(metadataSchema, "current_user_id")}());
 
 CREATE OR REPLACE FUNCTION ${mutateFunctionName}(
   p_local_id TEXT,
@@ -322,3 +332,4 @@ function quoteText(value) {
 function qualified(schema, name) {
   return `${quoteIdentifier(schema)}.${quoteIdentifier(name)}`;
 }
+
