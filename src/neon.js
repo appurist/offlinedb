@@ -77,7 +77,7 @@ export function createOdbDataClient(options) {
       });
 
       if (!response.ok) {
-        throw new Error(`Neon Data API request failed with status ${response.status}`);
+        throw await createHttpError(response, "Neon Data API request failed");
       }
 
       return readJsonIfPossible(response);
@@ -130,14 +130,28 @@ export function createOdbSyncTransport(options) {
       const conflicts = [];
 
       for (const mutation of request.mutations) {
-        const result = normalizeRpcResult(
-          await options.dataClient.odbRpc(mutateFunctionName(mutation.table), {
-            p_local_id: mutation.localId,
-            p_row_key: mutation.key,
-            p_base_revision: mutation.baseRevision,
-            p_values: mutation.values
-          })
-        );
+        let result;
+        try {
+          result = normalizeRpcResult(
+            await options.dataClient.odbRpc(mutateFunctionName(mutation.table), {
+              p_local_id: mutation.localId,
+              p_row_key: mutation.key,
+              p_base_revision: mutation.baseRevision,
+              p_values: mutation.values
+            })
+          );
+        } catch (error) {
+          if (!isMutationConflict(error)) {
+            throw error;
+          }
+
+          conflicts.push({
+            localId: mutation.localId,
+            code: error.body?.code ?? `http_${error.status}`,
+            serverRow: error.body?.row ?? null
+          });
+          continue;
+        }
 
         if (result?.ok === false) {
           conflicts.push({
@@ -235,6 +249,10 @@ function isMissingPagedFunction(error) {
   return /status 404|function .*pull_changes_page|could not find.*pull_changes_page|schema cache/i.test(error?.message ?? "");
 }
 
+function isMutationConflict(error) {
+  return error?.status === 409 || error?.body?.code === "23505";
+}
+
 async function odbPostJson(fetchImpl, url, body) {
   const response = await fetchImpl(url, {
     method: "POST",
@@ -245,10 +263,21 @@ async function odbPostJson(fetchImpl, url, body) {
   });
 
   if (!response.ok) {
-    throw new Error(`Auth request failed with status ${response.status}`);
+    throw await createHttpError(response, "Auth request failed");
   }
 
   return readJsonIfPossible(response);
+}
+
+async function createHttpError(response, message) {
+  const body = await readJsonIfPossible(response);
+  const detail = typeof body === "string" ? body : body?.message;
+  const error = new Error(`${message} with status ${response.status}${detail ? `: ${detail}` : ""}`);
+  error.name = "OdbHttpError";
+  error.status = response.status;
+  error.body = body;
+  error.code = typeof body === "object" && body != null ? body.code : undefined;
+  return error;
 }
 
 async function readJsonIfPossible(response) {

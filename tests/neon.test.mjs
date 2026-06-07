@@ -50,6 +50,30 @@ test("odb data client sends bearer token and rpc path", async () => {
   assert.equal(calls[0].init.headers.authorization, "Bearer jwt-123");
 });
 
+test("odb data client includes response body on http errors", async () => {
+  const client = createOdbDataClient({
+    baseUrl: "https://data.example.test/",
+    fetchImpl: async () => new Response(JSON.stringify({
+      code: "23505",
+      message: "duplicate key value violates unique constraint"
+    }), {
+      status: 409,
+      headers: { "content-type": "application/json" }
+    })
+  });
+
+  await assert.rejects(
+    () => client.odbRpc("mutate_tasks", {}),
+    (error) => {
+      assert.equal(error.name, "OdbHttpError");
+      assert.equal(error.status, 409);
+      assert.equal(error.code, "23505");
+      assert.equal(error.body.message, "duplicate key value violates unique constraint");
+      return true;
+    }
+  );
+});
+
 test("odb sync transport uses direct rpc calls for mutate and paged pull", async () => {
   const calls = [];
   const data = {
@@ -114,6 +138,60 @@ test("odb sync transport uses direct rpc calls for mutate and paged pull", async
   assert.equal(calls[1].args.p_limit, 500);
   assert.equal(result.accepted[0].globalId, 7);
   assert.equal(result.lastGlobalId, 7);
+});
+
+test("odb sync transport treats mutation 409s as row conflicts and continues", async () => {
+  const calls = [];
+  const data = {
+    async odbRpc(fn, args) {
+      calls.push({ fn, args });
+      if (fn === "mutate_tasks") {
+        const error = new Error("Neon Data API request failed with status 409");
+        error.name = "OdbHttpError";
+        error.status = 409;
+        error.body = {
+          code: "23505",
+          message: "duplicate key value violates unique constraint"
+        };
+        throw error;
+      }
+
+      if (fn === "pull_changes_page") {
+        return {
+          changes: [],
+          lastGlobalId: 12,
+          hasMore: false
+        };
+      }
+
+      throw new Error(`Unexpected rpc ${fn}`);
+    }
+  };
+
+  const transport = createOdbSyncTransport({ dataClient: data });
+  const result = await transport.sync({
+    mutations: [
+      {
+        localId: "l-conflict",
+        globalId: 0,
+        clientSequence: 1,
+        table: "tasks",
+        key: "task-1",
+        baseRevision: 0,
+        values: { id: "task-1" },
+        occurredAt: "2026-04-03T12:00:00.000Z"
+      }
+    ],
+    tables: ["tasks"],
+    lastGlobalId: 10
+  });
+
+  assert.deepEqual(calls.map((call) => call.fn), ["mutate_tasks", "pull_changes_page"]);
+  assert.equal(result.accepted.length, 0);
+  assert.equal(result.conflicts.length, 1);
+  assert.equal(result.conflicts[0].localId, "l-conflict");
+  assert.equal(result.conflicts[0].code, "23505");
+  assert.equal(result.lastGlobalId, 12);
 });
 
 test("odb sync transport falls back to legacy pull when paged rpc is unavailable", async () => {

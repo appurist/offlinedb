@@ -1,6 +1,6 @@
 {
   "name": "@appurist/offlinedb",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "type": "module",
   "description": "Browser-first offline table client for Neon Auth and Postgres RLS.",
   "author": "Appurist Software Inc. <dev@appurist.com>",
