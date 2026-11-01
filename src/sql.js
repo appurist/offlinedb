@@ -181,7 +181,12 @@ BEGIN
     END IF;
   END IF;
   IF TG_OP = 'INSERT' THEN
-    NEW.${table.revisionColumn} := COALESCE(NEW.${table.revisionColumn}, 0) + 1;
+    -- The client inserts at revision 1 and keeps that number locally; adding
+    -- one here would leave the server a revision ahead, so the client's next
+    -- queued change for the row would be rejected as a conflict.
+    IF COALESCE(NEW.${table.revisionColumn}, 0) <= 0 THEN
+      NEW.${table.revisionColumn} := 1;
+    END IF;
   ELSE
     NEW.${table.revisionColumn} := OLD.${table.revisionColumn} + 1;
   END IF;
@@ -237,6 +242,9 @@ AS $$
 DECLARE
   existing_row ${tableName}%ROWTYPE;
   next_row ${tableName}%ROWTYPE;
+  row_exists BOOLEAN;
+  payload JSONB;
+  column_list TEXT;
   set_clause TEXT;
   upsert_sql TEXT;
 BEGIN
@@ -245,8 +253,10 @@ BEGIN
   FROM ${tableName}
   WHERE ${table.primaryKey}::TEXT = p_row_key
   FOR UPDATE;
+  -- Captured now: every later INSERT/UPDATE/DELETE statement resets FOUND.
+  row_exists := FOUND;
 
-  IF FOUND AND existing_row.${table.revisionColumn} <> p_base_revision THEN
+  IF row_exists AND existing_row.${table.revisionColumn} <> p_base_revision THEN
     RETURN jsonb_build_object(
       'ok', false,
       'code', 'revision_conflict',
@@ -258,41 +268,65 @@ BEGIN
   VALUES (${qualified(metadataSchema, "current_user_id")}(), p_local_id, ${quoteText(table.name)}, p_row_key)
   ON CONFLICT (user_id, local_id) DO NOTHING;
 
-  SELECT string_agg(
-    format('%1$I = EXCLUDED.%1$I', column_name),
-    ', '
-    ORDER BY ordinal_position
-  )
-  INTO set_clause
+  -- A NULL payload is the delete tombstone queued by client.delete(). Deleting
+  -- a row that is already gone is accepted so the client's queue drains.
+  IF p_values IS NULL THEN
+    IF row_exists THEN
+      DELETE FROM ${tableName}
+      WHERE ${table.primaryKey}::TEXT = p_row_key;
+    END IF;
+    RETURN jsonb_build_object(
+      'ok', true,
+      'localId', p_local_id,
+      'globalId', 0,
+      'row', NULL
+    );
+  END IF;
+
+  payload := jsonb_set(
+    jsonb_set(
+      jsonb_set(
+        jsonb_set(
+          p_values,
+          ${quoteText(`{${table.primaryKey}}`)},
+          to_jsonb(p_row_key)
+        ),
+        ${quoteText(`{${table.localIdColumn}}`)},
+        to_jsonb(p_local_id)
+      ),
+      ${quoteText(`{${table.ownerColumn}}`)},
+      to_jsonb(COALESCE(p_values ->> ${quoteText(table.ownerColumn)}, ${qualified(metadataSchema, "current_user_id")}()))
+    ),
+    ${quoteText(`{${table.globalIdColumn}}`)},
+    COALESCE(
+      p_values -> ${quoteText(table.globalIdColumn)},
+      '0'::jsonb
+    )
+  );
+
+  -- Only the columns present in the payload are written. Columns the client
+  -- does not know about keep their table default on insert and their current
+  -- value on update, instead of being set to NULL by a positional INSERT.
+  SELECT
+    string_agg(format('%I', column_name), ', ' ORDER BY ordinal_position),
+    string_agg(format('%1$I = EXCLUDED.%1$I', column_name), ', ' ORDER BY ordinal_position)
+      FILTER (WHERE column_name <> ${quoteText(table.primaryKey)})
+  INTO column_list, set_clause
   FROM information_schema.columns
   WHERE table_schema = ${quoteText(schema)}
     AND table_name = ${quoteText(table.name)}
-    AND column_name <> ${quoteText(table.primaryKey)};
+    AND payload ? column_name::TEXT;
 
   upsert_sql := format(
-    'INSERT INTO %1$s SELECT * FROM jsonb_populate_record(NULL::%1$s, $1) ON CONFLICT (%2$I) DO UPDATE SET %3$s RETURNING *',
+    'INSERT INTO %1$s (%2$s) SELECT %2$s FROM jsonb_populate_record(NULL::%1$s, $1) ON CONFLICT (%3$I) DO UPDATE SET %4$s RETURNING *',
     ${quoteText(tableName)},
+    column_list,
     ${quoteText(table.primaryKey)},
     set_clause
   );
 
   EXECUTE upsert_sql
-    USING jsonb_set(
-      jsonb_set(
-        jsonb_set(
-          p_values,
-          ${quoteText(`{${table.localIdColumn}}`)},
-          to_jsonb(p_local_id)
-        ),
-        ${quoteText(`{${table.ownerColumn}}`)},
-        to_jsonb(COALESCE(p_values ->> ${quoteText(table.ownerColumn)}, ${qualified(metadataSchema, "current_user_id")}()))
-      ),
-      ${quoteText(`{${table.globalIdColumn}}`)},
-      COALESCE(
-        p_values -> ${quoteText(table.globalIdColumn)},
-        '0'::jsonb
-      )
-    )
+    USING payload
     INTO next_row;
 
   UPDATE ${qualified(metadataSchema, "applied_mutation")}

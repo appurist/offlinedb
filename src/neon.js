@@ -192,6 +192,9 @@ export function createOdbSyncTransport(options) {
   };
 }
 
+// The pull is never narrowed by `request.tables`: the client advances a single
+// global cursor, and a pull restricted to some tables would move that cursor
+// past changes in the other tables, which would then never be fetched.
 async function pullChangesPaged(args) {
   let pageSize = args.initialPageSize;
   let lastGlobalId = Number(args.request.lastGlobalId ?? 0);
@@ -203,7 +206,7 @@ async function pullChangesPaged(args) {
       page = normalizeRpcResult(
         await args.dataClient.odbRpc(args.pullPageFunctionName, {
           p_last_global_id: lastGlobalId,
-          p_tables: args.request.tables?.length ? args.request.tables : null,
+          p_tables: null,
           p_limit: pageSize
         })
       );
@@ -212,7 +215,7 @@ async function pullChangesPaged(args) {
         return normalizeRpcResult(
           await args.dataClient.odbRpc(args.pullFunctionName, {
             p_last_global_id: lastGlobalId,
-            p_tables: args.request.tables?.length ? args.request.tables : null
+            p_tables: null
           })
         ) ?? { changes: [], lastGlobalId };
       }
@@ -227,7 +230,7 @@ async function pullChangesPaged(args) {
       page = normalizeRpcResult(
         await args.dataClient.odbRpc(args.pullFunctionName, {
           p_last_global_id: lastGlobalId,
-          p_tables: args.request.tables?.length ? args.request.tables : null
+          p_tables: null
         })
       ) ?? { changes: [], lastGlobalId };
     }

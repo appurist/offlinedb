@@ -178,6 +178,13 @@ export class OfflineDbClient {
   }
 
   /**
+   * Push every pending local change, then pull the whole replica forward.
+   *
+   * `tables` only validates the names and is forwarded to the transport; the
+   * pull itself is never narrowed. The client keeps one `lastGlobalId` across
+   * all tables, so a pull limited to some tables would advance that cursor
+   * past changes in the others and they would never be fetched.
+   *
    * @param {{tables?: string[]}=} options
    */
   async sync(options = {}) {
@@ -235,7 +242,10 @@ export class OfflineDbClient {
     }
 
     for (const change of result.changes) {
-      this.#requireTable(change.table);
+      // The pull covers every table in the log; keep only the ones this client replicates.
+      if (!this.tables.has(change.table)) {
+        continue;
+      }
       if (change.row == null) {
         await this.persistence.deleteRow(change.table, change.key);
         continue;

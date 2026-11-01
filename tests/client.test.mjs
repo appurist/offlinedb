@@ -484,3 +484,32 @@ function createFakeLocalStorage() {
     }
   };
 }
+
+test("sync narrowed to one table still applies pulled changes for the others", async () => {
+  const tasks = defineTable({ name: "tasks" });
+  const notes = defineTable({ name: "notes" });
+  const persistence = new InMemoryPersistence();
+  const client = await OfflineDbClient.open({
+    persistence,
+    transport: {
+      async sync() {
+        return {
+          accepted: [],
+          conflicts: [],
+          changes: [
+            { table: "tasks", key: "task-1", row: { id: "task-1", title: "From elsewhere", revision: 1, local_id: null } },
+            { table: "unregistered", key: "x", row: { id: "x" } }
+          ],
+          lastGlobalId: 9
+        };
+      }
+    },
+    tables: [tasks, notes]
+  });
+
+  await client.sync({ tables: ["notes"] });
+
+  assert.equal((await client.get("tasks", "task-1")).title, "From elsewhere");
+  assert.deepEqual(await persistence.listRows("unregistered"), []);
+  assert.equal(await persistence.getLastGlobalId(), 9);
+});

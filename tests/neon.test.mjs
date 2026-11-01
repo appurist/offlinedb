@@ -136,6 +136,7 @@ test("odb sync transport uses direct rpc calls for mutate and paged pull", async
   assert.equal(calls[0].fn, "mutate_tasks");
   assert.equal(calls[1].fn, "pull_changes_page");
   assert.equal(calls[1].args.p_limit, 500);
+  assert.equal(calls[1].args.p_tables, null, "pull is never narrowed by tables");
   assert.equal(result.accepted[0].globalId, 7);
   assert.equal(result.lastGlobalId, 7);
 });

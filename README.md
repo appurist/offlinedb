@@ -116,7 +116,8 @@ await client.sync();
 - local pending writes are sent with `localId`
 - the remote side assigns `globalId` values to accepted writes
 - the client advances `lastGlobalId` after applying accepted and remote changes
-- `tables: [...]` is optional and only narrows one sync pass
+- `tables: [...]` is optional and only validates the names; the pull is always whole-replica because the cursor is global
+- `client.delete()` queues a tombstone (a `NULL` payload) that the generated `mutate_<table>` RPC applies as a row delete
 
 ## Public API
 

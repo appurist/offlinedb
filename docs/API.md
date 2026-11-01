@@ -147,8 +147,10 @@ const result = await client.sync();
 ##### `options`
 
 - `tables`
-  Optional list of registered table names to include in this sync pass.
-  When omitted, the client syncs all registered tables.
+  Optional list of registered table names. They are validated and forwarded
+  to the transport, but the pull is never narrowed: the client keeps one
+  `lastGlobalId` for all tables, and a pull limited to some tables would
+  advance that cursor past changes in the others.
 
 ##### Request sent to transport
 
@@ -167,7 +169,7 @@ Where:
 - `mutations`
   The current pending local-change queue, sorted by `clientSequence`.
 - `tables`
-  Optional table-name filter for the current sync pass.
+  The registered table names for this pass (informational; see above).
 - `lastGlobalId`
   The client's last applied global id.
 
@@ -206,7 +208,7 @@ The transport must return:
 - Accepted local ids are removed from the pending queue.
 - Conflicted local ids are removed from the pending queue.
 - If a conflict includes `serverRow`, that row replaces the local optimistic row.
-- Incoming `changes` are applied to the local replica.
+- Incoming `changes` are applied to the local replica; changes for tables this client did not register are ignored.
 - A `null` row in `changes` deletes the local row.
 - The returned `lastGlobalId` becomes the client's new high-water mark.
 
@@ -432,7 +434,7 @@ const transport = createOdbSyncTransport({
 ### Behavior
 
 - calls `mutate_<table>` once per pending local change
-- then calls `pull_changes(lastGlobalId, tables?)`
+- then calls `pull_changes_page(lastGlobalId)` (falling back to `pull_changes`) for every table, never narrowed by `tables`
 - returns the normalized sync result expected by `OfflineDbClient`
 
 This is the intended browser runtime path for the Neon-native version of the library.
@@ -592,4 +594,4 @@ These are real current limits of the implementation:
 - There is no built-in subscription API yet.
 - There is no exported TypeScript typing surface.
 - There is no finalized live Neon wire contract in this repo yet.
-- Delete operations are only represented through remote `changes` entries with `row: null`; there is no dedicated local delete helper.
+- `client.delete()` removes the row locally and queues a `NULL`-payload mutation; the generated `mutate_<table>` RPC applies it as a delete, and other clients receive it as a `changes` entry with `row: null`.

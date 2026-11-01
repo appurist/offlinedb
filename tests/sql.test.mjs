@@ -39,3 +39,16 @@ test("synced table sql includes required columns, triggers, RLS, and mutation rp
   assert.match(sql, /revision_conflict/);
 });
 
+
+test("synced table sql keeps the client's revision on insert, deletes on a NULL payload, and writes only payload columns", () => {
+  const sql = createSyncedTableSql({
+    table: defineTable({ name: "tasks" })
+  });
+
+  assert.match(sql, /IF COALESCE\(NEW\.revision, 0\) <= 0 THEN\s+NEW\.revision := 1;/);
+  assert.doesNotMatch(sql, /NEW\.revision := COALESCE\(NEW\.revision, 0\) \+ 1/);
+  assert.match(sql, /row_exists := FOUND;/);
+  assert.match(sql, /IF p_values IS NULL THEN\s+IF row_exists THEN\s+DELETE FROM "public"\."tasks"/);
+  assert.match(sql, /AND payload \? column_name::TEXT/);
+  assert.match(sql, /INSERT INTO %1\$s \(%2\$s\) SELECT %2\$s FROM jsonb_populate_record/);
+});
