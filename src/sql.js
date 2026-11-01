@@ -21,6 +21,10 @@ CREATE TABLE IF NOT EXISTS ${qualified(schema, "global_mutation")} (
   row_data JSONB
 );
 
+-- Lets mutate_<table> find a row's delete tombstone without scanning the log.
+CREATE INDEX IF NOT EXISTS ${quoteIdentifier("global_mutation_table_row_idx")}
+  ON ${qualified(schema, "global_mutation")} (table_name, row_key);
+
 CREATE TABLE IF NOT EXISTS ${qualified(schema, "applied_mutation")} (
   user_id TEXT NOT NULL,
   local_id TEXT NOT NULL,
@@ -243,6 +247,7 @@ DECLARE
   existing_row ${tableName}%ROWTYPE;
   next_row ${tableName}%ROWTYPE;
   row_exists BOOLEAN;
+  applied_global_id BIGINT;
   payload JSONB;
   column_list TEXT;
   set_clause TEXT;
@@ -256,11 +261,45 @@ BEGIN
   -- Captured now: every later INSERT/UPDATE/DELETE statement resets FOUND.
   row_exists := FOUND;
 
-  IF row_exists AND existing_row.${table.revisionColumn} <> p_base_revision THEN
+  -- A retry of a mutation that already committed (the client never saw the
+  -- response). Report the same outcome again instead of applying it twice.
+  SELECT global_id INTO applied_global_id
+  FROM ${qualified(metadataSchema, "applied_mutation")}
+  WHERE user_id = ${qualified(metadataSchema, "current_user_id")}()
+    AND local_id = p_local_id;
+  IF FOUND THEN
+    RETURN jsonb_build_object(
+      'ok', true,
+      'localId', p_local_id,
+      'globalId', COALESCE(applied_global_id, 0),
+      'row', CASE WHEN row_exists THEN to_jsonb(existing_row) ELSE NULL END
+    );
+  END IF;
+
+  -- A delete is applied whatever the row's revision: the user asked for the
+  -- row to go, and a stale base revision must not resurrect it on the client.
+  IF row_exists AND p_values IS NOT NULL AND existing_row.${table.revisionColumn} <> p_base_revision THEN
     RETURN jsonb_build_object(
       'ok', false,
       'code', 'revision_conflict',
       'row', to_jsonb(existing_row)
+    );
+  END IF;
+
+  -- The client is editing a row it once held (base revision above 0) that the
+  -- server has since deleted. Re-inserting it would resurrect the row on every
+  -- other client; the client drops its stale copy instead.
+  IF NOT row_exists AND p_values IS NOT NULL AND COALESCE(p_base_revision, 0) > 0 AND EXISTS (
+    SELECT 1
+    FROM ${qualified(metadataSchema, "global_mutation")} gm
+    WHERE gm.table_name = ${quoteText(table.name)}
+      AND gm.row_key = p_row_key
+      AND gm.operation = 'delete'
+  ) THEN
+    RETURN jsonb_build_object(
+      'ok', false,
+      'code', 'deleted',
+      'row', NULL
     );
   END IF;
 

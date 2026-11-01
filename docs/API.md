@@ -205,12 +205,33 @@ The transport must return:
 
 ##### Sync behavior
 
+- Syncs run one at a time per client. A `sync()` or `repairSync()` call made while another is in flight waits for it, so the same pending mutations are never pushed twice.
 - Accepted local ids are removed from the pending queue.
 - Conflicted local ids are removed from the pending queue.
 - If a conflict includes `serverRow`, that row replaces the local optimistic row.
-- Incoming `changes` are applied to the local replica; changes for tables this client did not register are ignored.
+- A conflict with `code: "deleted"` (the server already deleted the row) removes the local row.
+- A conflict with any other code and no `serverRow` (for example a Postgres `23505` unique violation) leaves the local row as it is; it is marked as a touched row with `lastError` set to the code, and `getSyncStatus().errorCount` counts such rows.
+- A row that received a newer local change while the push was in flight is not overwritten by the server's echo of the older change, nor by a conflict for it; the newer change settles the row when it is pushed.
+- Incoming `changes` are applied to the local replica; changes for tables this client did not register, and changes for rows that still have a pending local mutation, are ignored.
 - A `null` row in `changes` deletes the local row.
 - The returned `lastGlobalId` becomes the client's new high-water mark.
+
+##### Return value
+
+The transport's result, with each conflict extended by `table`, `key` and `resolution`:
+
+- `"server_row"`: the server's row replaced the local one
+- `"deleted_local"`: the local row was removed
+- `"kept_local"`: the local row was left unchanged (the write was rejected without a server row)
+- `"superseded"`: a newer local change for the row is still queued
+
+#### `await client.getSyncStatus(options?)`
+
+Returns `{ pendingCount, touchedCount, errorCount, lastGlobalId }` for the given `tables` (default: all).
+
+#### `await client.close()`
+
+Releases the persistence layer's resources (the IndexedDB connection). The client must not be used afterwards.
 
 #### `await client.exportState()`
 
@@ -272,6 +293,16 @@ const persistence = new IndexedDbPersistence({
 - stores the full persistence snapshot under the key `snapshot`
 - loads the snapshot during `initialize()`
 - persists after every mutating operation
+- keeps one open connection, reopened on demand after `close()` or after another tab asks for a version change
+
+### Additional methods
+
+- `await persistence.importState(snapshot)`
+  Replaces the whole local state with a snapshot and persists it.
+- `await persistence.close()`
+  Closes the IndexedDB connection.
+- `await IndexedDbPersistence.readSnapshot({ databaseName, indexedDb? })`
+  Static. Reads the stored snapshot of a database without keeping it open; `null` when nothing was stored. Together with `importState` this moves a replica from one database name to another (for example from a shared database to a per-user one).
 
 `IndexedDbPersistence` is the default because it matches the browser-first, local-replica model of the library more closely than an in-memory-only store.
 
@@ -399,6 +430,8 @@ const data = createOdbDataClient({
   Optional async token provider.
 - `headers`
   Optional default headers.
+- `timeoutMs`
+  Optional request timeout in milliseconds, default `30000`. A request that has not answered in time is aborted and rejects with an `OdbTimeoutError`, so a stalled connection fails the sync instead of hanging it. `0` disables the timeout.
 
 ### Methods
 
@@ -434,6 +467,9 @@ const transport = createOdbSyncTransport({
 ### Behavior
 
 - calls `mutate_<table>` once per pending local change
+- an RPC answer with `ok: false` becomes a conflict with its `code` (`revision_conflict`, `deleted`, `forbidden`)
+- an HTTP 409 or a `23505` unique violation from the database becomes a conflict with the SQLSTATE as `code` and the database's `details` or `message` as `message`; the rest of the queue is still pushed
+- any other HTTP error aborts the sync
 - then calls `pull_changes_page(lastGlobalId)` (falling back to `pull_changes`) for every table, never narrowed by `tables`
 - returns the normalized sync result expected by `OfflineDbClient`
 
@@ -579,6 +615,14 @@ The current generator emits SQL for:
 - owner-write insert/update RLS policies
 - a table-specific mutation RPC function named like `offlinedb.mutate_tasks`
 
+The mutation RPC:
+
+- answers a retry of a mutation it has already applied (same user and `localId`, found in `applied_mutation`) with the same `ok` result instead of applying it again
+- rejects an upsert whose `p_base_revision` differs from the row's current revision with `revision_conflict` and the current row
+- applies a delete (`NULL` payload) whatever the row's revision, and accepts a delete of a row that is already gone
+- rejects an upsert for a row the client once held (`p_base_revision` above 0) that the server has since deleted with `code: "deleted"`, so the client drops its stale copy instead of resurrecting the row
+- writes only the columns present in the payload, so columns the client does not send keep their defaults
+
 ### Current caveats
 
 - The table must use a single primary key column.
@@ -595,3 +639,5 @@ These are real current limits of the implementation:
 - There is no exported TypeScript typing surface.
 - There is no finalized live Neon wire contract in this repo yet.
 - `client.delete()` removes the row locally and queues a `NULL`-payload mutation; the generated `mutate_<table>` RPC applies it as a delete, and other clients receive it as a `changes` entry with `row: null`.
+- The built-in persistence layers write the whole snapshot on every change and hold one snapshot per database name. Two tabs open on the same database overwrite each other's snapshot; give each user their own `databaseName` and keep one tab active per database.
+- The pull cursor is the highest `global_id` seen. Two writers committing at the same moment can commit out of `global_id` order, so a change with a lower id than one already pulled is missed until the next `repairSync()`. Single-user data (one writer at a time per owner) is not affected.

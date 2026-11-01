@@ -53,11 +53,17 @@ export function createOdbAuthClient(options) {
  *   baseUrl: string,
  *   fetchImpl?: typeof fetch,
  *   getAuthToken?: () => Promise<string | null> | string | null,
- *   headers?: HeadersInit
+ *   headers?: HeadersInit,
+ *   timeoutMs?: number
  * }} options
+ *
+ * `timeoutMs` (default 30000) aborts a request that has not answered in time,
+ * so a stalled connection fails the sync instead of hanging it forever. Pass 0
+ * to disable.
  */
 export function createOdbDataClient(options) {
   const fetchImpl = options.fetchImpl ?? fetch;
+  const timeoutMs = Number(options.timeoutMs ?? 30000);
 
   return {
     /**
@@ -65,16 +71,34 @@ export function createOdbDataClient(options) {
      */
     async odbRequest(args) {
       const token = await options.getAuthToken?.();
-      const response = await fetchImpl(joinUrl(options.baseUrl, args.path), {
-        method: args.method ?? "GET",
-        headers: {
-          ...(args.body != null ? { "content-type": "application/json" } : {}),
-          ...(options.headers ?? {}),
-          ...(args.headers ?? {}),
-          ...(token ? { authorization: `Bearer ${token}` } : {})
-        },
-        body: args.body == null ? undefined : JSON.stringify(args.body)
-      });
+      const controller = timeoutMs > 0 && typeof AbortController !== "undefined" ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+      let response;
+      try {
+        response = await fetchImpl(joinUrl(options.baseUrl, args.path), {
+          method: args.method ?? "GET",
+          headers: {
+            ...(args.body != null ? { "content-type": "application/json" } : {}),
+            ...(options.headers ?? {}),
+            ...(args.headers ?? {}),
+            ...(token ? { authorization: `Bearer ${token}` } : {})
+          },
+          body: args.body == null ? undefined : JSON.stringify(args.body),
+          ...(controller ? { signal: controller.signal } : {})
+        });
+      } catch (error) {
+        if (controller?.signal.aborted) {
+          const timeoutError = new Error(`Neon Data API request timed out after ${timeoutMs}ms`);
+          timeoutError.name = "OdbTimeoutError";
+          timeoutError.cause = error;
+          throw timeoutError;
+        }
+        throw error;
+      } finally {
+        if (timer) {
+          clearTimeout(timer);
+        }
+      }
 
       if (!response.ok) {
         throw await createHttpError(response, "Neon Data API request failed");
@@ -145,10 +169,14 @@ export function createOdbSyncTransport(options) {
             throw error;
           }
 
+          // A write the database rejected for this row alone (a unique
+          // violation, for example). It is reported as a conflict so the rest
+          // of the queue still drains; the caller decides what to tell the user.
           conflicts.push({
             localId: mutation.localId,
             code: error.body?.code ?? `http_${error.status}`,
-            serverRow: error.body?.row ?? null
+            serverRow: error.body?.row ?? null,
+            message: error.body?.details ?? error.body?.message ?? error.message
           });
           continue;
         }

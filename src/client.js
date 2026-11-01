@@ -37,10 +37,16 @@ import { defineTable } from "./schema.js";
 /**
  * @typedef {{
  *   accepted: Array<{localId: string, globalId: number, row?: Record<string, unknown> | null}>,
- *   conflicts: Array<{localId: string, code: "revision_conflict", serverRow: Record<string, unknown> | null}>,
+ *   conflicts: Array<{localId: string, code: string, serverRow: Record<string, unknown> | null, message?: string}>,
  *   changes: ChangeRecord[],
  *   lastGlobalId: number
  * }} SyncResult
+ *
+ * `code` is `"revision_conflict"`, `"deleted"` (the server already deleted the
+ * row), `"forbidden"`, or the Postgres SQLSTATE of a rejected write such as
+ * `"23505"` (unique violation). `client.sync()` adds `table`, `key` and
+ * `resolution` (`"server_row"`, `"deleted_local"`, `"kept_local"` or
+ * `"superseded"`) to each conflict it returns.
  */
 
 export class OfflineDbClient {
@@ -189,6 +195,22 @@ export class OfflineDbClient {
    */
   async sync(options = {}) {
     const tableNames = this.#resolveTables(options.tables);
+    return this.#enqueueSync(() => this.#syncOnce(tableNames));
+  }
+
+  /**
+   * Syncs run one at a time. Two overlapping runs would push the same pending
+   * mutations twice and race each other on the cursor and the local rows.
+   */
+  #syncChain = Promise.resolve();
+
+  #enqueueSync(job) {
+    const run = this.#syncChain.then(job, job);
+    this.#syncChain = run.catch(() => {});
+    return run;
+  }
+
+  async #syncOnce(tableNames) {
     const [mutations, lastGlobalId] = await Promise.all([
       this.persistence.getPendingMutations(),
       this.persistence.getLastGlobalId()
@@ -207,18 +229,21 @@ export class OfflineDbClient {
         continue;
       }
 
+      const table = this.#requireTable(mutation.table);
+      const current = await this.persistence.getRow(mutation.table, mutation.key);
+      // A newer local change for this row was queued while the push was in
+      // flight. Its own push settles the row; writing the server's echo of the
+      // older change here would discard that edit.
+      if (current && current[table.localIdColumn] !== accepted.localId) {
+        continue;
+      }
+
       if (accepted.row) {
         await this.persistence.saveRow(mutation.table, mutation.key, accepted.row);
         continue;
       }
 
-      const current = await this.persistence.getRow(mutation.table, mutation.key);
       if (!current) {
-        continue;
-      }
-
-      const table = this.#requireTable(mutation.table);
-      if (current[table.localIdColumn] !== accepted.localId) {
         continue;
       }
 
@@ -229,6 +254,7 @@ export class OfflineDbClient {
       });
     }
 
+    const conflicts = [];
     for (const conflict of result.conflicts) {
       const mutation = mutations.find((entry) => entry.localId === conflict.localId);
       if (!mutation) {
@@ -236,14 +262,41 @@ export class OfflineDbClient {
       }
 
       await this.persistence.acknowledgeMutations([conflict.localId]);
-      if (conflict.serverRow) {
+      const table = this.#requireTable(mutation.table);
+      const current = await this.persistence.getRow(mutation.table, mutation.key);
+      const superseded = !!current && current[table.localIdColumn] !== mutation.localId;
+      let resolution = "kept_local";
+      if (!superseded && conflict.code === "deleted") {
+        // The server already deleted this row; the local copy is stale.
+        await this.persistence.deleteRow(mutation.table, mutation.key);
+        resolution = "deleted_local";
+      } else if (!superseded && conflict.serverRow) {
         await this.persistence.saveRow(mutation.table, mutation.key, conflict.serverRow);
+        resolution = "server_row";
+      } else if (superseded) {
+        resolution = "superseded";
       }
+      await this.persistence.markTouchedRowError?.(mutation.table, mutation.key, conflict.code ?? "conflict");
+      conflicts.push({
+        ...conflict,
+        table: mutation.table,
+        key: mutation.key,
+        resolution
+      });
     }
+
+    // Rows with a change still queued (including ones queued during this push)
+    // are left alone: the server's copy would overwrite the local edit, and the
+    // queued push settles the row either way.
+    const stillPending = await this.persistence.getPendingMutations();
+    const pendingKeys = new Set(stillPending.map((entry) => `${entry.table}:${entry.key}`));
 
     for (const change of result.changes) {
       // The pull covers every table in the log; keep only the ones this client replicates.
       if (!this.tables.has(change.table)) {
+        continue;
+      }
+      if (pendingKeys.has(`${change.table}:${change.key}`)) {
         continue;
       }
       if (change.row == null) {
@@ -255,7 +308,7 @@ export class OfflineDbClient {
     }
 
     await this.persistence.setLastGlobalId(result.lastGlobalId);
-    return result;
+    return { ...result, conflicts };
   }
 
   /**
@@ -318,15 +371,18 @@ export class OfflineDbClient {
     }
 
     options.onProgress?.({ phase: "sync", current: 0, total: 1, label: "Syncing with cloud..." });
-    const originalLastGlobalId = await this.persistence.getLastGlobalId();
-    await this.persistence.setLastGlobalId(0);
-    let result;
-    try {
-      result = await this.sync({ tables: tableNames });
-    } catch (error) {
-      await this.persistence.setLastGlobalId(originalLastGlobalId);
-      throw error;
-    }
+    // The cursor reset and the catch-up pull run as one queued job, so a sync
+    // already in flight cannot restore its own cursor over the reset.
+    const result = await this.#enqueueSync(async () => {
+      const originalLastGlobalId = await this.persistence.getLastGlobalId();
+      await this.persistence.setLastGlobalId(0);
+      try {
+        return await this.#syncOnce(tableNames);
+      } catch (error) {
+        await this.persistence.setLastGlobalId(originalLastGlobalId);
+        throw error;
+      }
+    });
     const pending = await this.persistence.getPendingMutations();
     const pendingKeys = new Set(pending.map((mutation) => `${mutation.table}:${mutation.key}`));
     const clearable = queuedTouched.filter((entry) => !pendingKeys.has(`${entry.table}:${entry.key}`));
@@ -352,12 +408,22 @@ export class OfflineDbClient {
     return {
       pendingCount: pending.filter((entry) => tableSet.has(entry.table)).length,
       touchedCount: touched.length,
+      // Rows whose last push was rejected (unique violation, revision conflict, deleted on the server).
+      errorCount: touched.filter((entry) => entry.lastError).length,
       lastGlobalId: await this.persistence.getLastGlobalId()
     };
   }
 
   async exportState() {
     return this.persistence.exportState();
+  }
+
+  /**
+   * Release the persistence layer's resources (the IndexedDB connection).
+   * The client must not be used afterwards.
+   */
+  async close() {
+    await this.persistence.close?.();
   }
 
   #requireTable(name) {
@@ -469,6 +535,42 @@ export class IndexedDbPersistence {
     return this.memory.exportState();
   }
 
+  /**
+   * Replace the whole local state with a snapshot (for example one read from
+   * another database with `IndexedDbPersistence.readSnapshot`).
+   */
+  async importState(state) {
+    await this.memory.importState(state);
+    await this.#persist();
+  }
+
+  async close() {
+    const db = this.#db;
+    this.#db = null;
+    db?.close?.();
+  }
+
+  /**
+   * Read the stored snapshot of a database without keeping it open.
+   * Returns `null` when nothing has been stored under that name.
+   *
+   * @param {{databaseName?: string, indexedDb?: IDBFactory}=} options
+   */
+  static async readSnapshot(options = {}) {
+    const persistence = new IndexedDbPersistence(options);
+    if (!persistence.indexedDb) {
+      throw new Error("IndexedDB persistence requires indexedDB to be available or injected.");
+    }
+    try {
+      return await persistence.#readSnapshot();
+    } finally {
+      await persistence.close();
+    }
+  }
+
+  #db = null;
+  #opening = null;
+
   async #persist() {
     const db = await this.#openDatabase();
     const snapshot = await this.memory.exportState();
@@ -492,17 +594,44 @@ export class IndexedDbPersistence {
     });
   }
 
+  // One connection per persistence instance. Opening a connection for every
+  // read and write leaked them, and an open connection with no close handler
+  // also blocked other tabs from upgrading or deleting the database.
   async #openDatabase() {
-    return new Promise((resolve, reject) => {
-      const request = this.indexedDb.open(this.databaseName, 1);
-      request.onupgradeneeded = () => {
-        if (!request.result.objectStoreNames.contains("state")) {
-          request.result.createObjectStore("state");
-        }
-      };
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error ?? new Error("IndexedDB open failed."));
-    });
+    if (this.#db) {
+      return this.#db;
+    }
+    if (!this.#opening) {
+      this.#opening = new Promise((resolve, reject) => {
+        const request = this.indexedDb.open(this.databaseName, 1);
+        request.onupgradeneeded = () => {
+          if (!request.result.objectStoreNames.contains("state")) {
+            request.result.createObjectStore("state");
+          }
+        };
+        request.onsuccess = () => {
+          const db = request.result;
+          db.onversionchange = () => {
+            // Another tab wants to upgrade or delete the database: let go and reopen on demand.
+            db.close?.();
+            if (this.#db === db) {
+              this.#db = null;
+            }
+          };
+          db.onclose = () => {
+            if (this.#db === db) {
+              this.#db = null;
+            }
+          };
+          this.#db = db;
+          resolve(db);
+        };
+        request.onerror = () => reject(request.error ?? new Error("IndexedDB open failed."));
+      }).finally(() => {
+        this.#opening = null;
+      });
+    }
+    return this.#opening;
   }
 }
 
@@ -597,6 +726,11 @@ export class LocalStoragePersistence {
 
   async exportState() {
     return this.memory.exportState();
+  }
+
+  async importState(state) {
+    await this.memory.importState(state);
+    await this.#persist();
   }
 
   async #persist() {
